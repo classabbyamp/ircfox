@@ -4,10 +4,13 @@ use anyhow::Result as AResult;
 
 use clap::Parser;
 
+use crossterm::style::Stylize;
+
 use liso::{InputOutput, liso, Response};
 
-use vinezombie::client;
-use vinezombie::client::handlers;
+use vinezombie::{client::{self, handlers, tls::{TlsConfigOptions, Trust}}, ircmsg::ServerMsg, names::cmd};
+use vinezombie::ircmsg::ClientMsg;
+use vinezombie::string as vzstr;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -36,6 +39,14 @@ struct Cli {
     port: Option<String>,
 }
 
+// fn format_clientmsg(msg: ClientMsg) -> String {
+//     
+// }
+//
+// fn format_servermsg(msg: ServerMsg) -> String {
+//     format!("{} {} {} {}", msg.tags.red())
+// }
+
 #[tokio::main]
 async fn main() -> AResult<()> {
     let cli = Cli::parse();
@@ -44,47 +55,79 @@ async fn main() -> AResult<()> {
     let out = io.clone_output();
     io.prompt(liso!(fg=green, bold, "-> ", reset), true, false);
 
-    let host: vinezombie::string::Word = cli.host.as_str().try_into()?;
+    let host: vzstr::Word = cli.host.as_str().try_into()?;
     let address = client::conn::ServerAddr::from_host(host)?;
 
-    let tls_options = client::tls::TlsConfigOptions {
-        trust: if cli.noverify { client::tls::Trust::NoVerify } else { client::tls::Trust::Default },
-        cert: cli.cert,
+    let mut tls_opt = TlsConfigOptions::default();
+    tls_opt.cert = cli.cert;
+    if cli.noverify {
+        tls_opt.trust = Trust::NoVerify;
     };
-    let sock = address.connect_tokio(|| tls_options.build()).await?;
+
+    let sock = address.connect_tokio(|| tls_opt.build()).await?;
 
     let mut client = client::Client::new(sock, client::channel::TokioChannels);
 
     let _ = client.add((), handlers::AutoPong);
-    let mut queue = client.queue_mut().edit();
     let (_, mut msgs) = client.add((), handlers::YieldAll).unwrap();
 
-    tokio::spawn(async move {
-        while let Some(msg) = msgs.recv().await {
-            out.println(format!("{msg}"));
-        }
-    });
+    let mut got_err = false;
+    let res = loop {
+        tokio::select! {
+            biased;
+            Some(msg) = msgs.recv() => {
+                out.println(format!("{msg}"));
 
-    tokio::spawn(async move {
-        loop {
-            let _ = client.run_tokio().await;
-        }
-    });
+                if msg.kind == cmd::ERROR {
+                    got_err = true;
+                    break Ok(());
+                }
+            }
+            res = client.run_tokio() => {
+                if let Err(e) = res {
+                    break Err(e);
+                }
+            }
+            input = io.read_async() => {
+                match input {
+                    Response::Quit | Response::Finish | Response::Dead => {
+                        let mut m = ClientMsg::new(cmd::QUIT);
+                        m.args.edit().add(vzstr::Arg::from_str("goodbye"));
+                        client.queue_mut().edit().push(m.clone());
+                        io.echoln(liso!(fg=green, bold, "-> ", reset, format!("{m}")));
+                    },
+                    Response::Input(s) => {
+                        if s.len() > 0 {
+                            match ClientMsg::parse(s.clone()) {
+                                Ok(m) => {
+                                    client.queue_mut().edit().push(m);
+                                    io.echoln(liso!(fg=green, bold, "-> ", reset, s));
+                                },
+                                Err(e) => io.echoln(liso!(fg=red, bold, "-> [", e.to_string(), "] ", reset, s)),
+                            }
+                        }
+                    },
+                    _ => (),
+                }
+            }
 
-    'input: loop {
-        match io.read_async().await {
-            Response::Quit | Response::Finish => {
-                // send QUIT
-                break 'input;
-            },
-            Response::Input(s) => {
-                let msg = vinezombie::ircmsg::ClientMsg::parse(s.clone()).unwrap();
-                queue.push(msg);
-                io.echoln(liso!(fg=green, bold, "-> ", reset, s));
-            },
-            _ => (),
-        };
+        }
+    };
+
+    io.die().await;
+    std::mem::drop(client);
+
+    while let Some(msg) = msgs.recv().await {
+        if msg.kind == cmd::ERROR {
+            got_err = true;
+        }
+        out.println(format!("{msg}"));
     }
 
-    Ok(())
+    if got_err {
+        Ok(())
+    } else {
+        //res.map_err(todo!())
+        todo!()
+    }
 }
