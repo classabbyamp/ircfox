@@ -26,17 +26,17 @@ struct Cli {
     cert: Option<PathBuf>,
     /// Log raw traffic to a file
     #[arg(short, long, value_name = "FILE")]
-    log: Option<PathBuf>,
+    log: Option<PathBuf>, // TODO
     /// Reconnect on connection close after a pause
     #[arg(long, value_name = "TIME")]
-    reconnect: Option<String>,
+    reconnect: Option<String>, // TODO
     /// Disable automatic ping responses
     #[arg(short, long)]
     noping: bool,
     /// Server to connect to
     host: String,
     /// Port to use when connecting to the server
-    port: Option<String>,
+    port: Option<u16>,
 }
 
 // fn format_clientmsg(msg: ClientMsg) -> String {
@@ -56,19 +56,24 @@ async fn main() -> AResult<()> {
     io.prompt(liso!(fg=green, bold, "-> ", reset), true, false);
 
     let host: vzstr::Word = cli.host.as_str().try_into()?;
-    let address = client::conn::ServerAddr::from_host(host)?;
+    let mut addr = client::conn::ServerAddr::from_host(host)?;
+    addr.tls = cli.tls;
+    addr.port = cli.port;
 
     let mut tls_opt = TlsConfigOptions::default();
     tls_opt.cert = cli.cert;
     if cli.noverify {
         tls_opt.trust = Trust::NoVerify;
-    };
+    }
 
-    let sock = address.connect_tokio(|| tls_opt.build()).await?;
+    let sock = addr.connect_tokio(|| tls_opt.build()).await?;
+
 
     let mut client = client::Client::new(sock, client::channel::TokioChannels);
 
-    let _ = client.add((), handlers::AutoPong);
+    if ! cli.noping {
+        let _ = client.add((), handlers::AutoPong);
+    }
     let (_, mut msgs) = client.add((), handlers::YieldAll).unwrap();
 
     let mut got_err = false;
@@ -114,7 +119,7 @@ async fn main() -> AResult<()> {
         }
     };
 
-    io.die().await;
+    std::mem::drop(io);
     std::mem::drop(client);
 
     while let Some(msg) = msgs.recv().await {
